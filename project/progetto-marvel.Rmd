@@ -1,0 +1,270 @@
+```markdown
+---
+title: "Universo Marvel: chi fa da ponte tra le comunità?"
+author: "Alessio Castronovo"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = TRUE)
+```
+
+# 1. Introduzione e Domande di Ricerca
+
+L'analisi delle reti applicata agli universi narrativi offre una prospettiva quantitativa per comprendere come interagiscono i personaggi e come si strutturano le relazioni all'interno di saghe complesse. In questo studio abbiamo integrato la rete di co-apparizione dei personaggi dell'Universo Marvel (chi compare insieme a chi nelle storie a fumetti) con un dataset contenente gli attributi individuali dei singoli eroi e villain, tra cui intelligenza, forza fisica e affiliazioni ai gruppi. L'obiettivo principale è indagare il ruolo dei cosiddetti *boundary spanner*, ovvero quei nodi strategici che agiscono da "ponte" tra comunità distinte e altrimenti isolate all'interno del grafo. Dal punto di vista teorico, questo fenomeno si ricollega direttamente alla teoria della "forza dei legami deboli" di Mark Granovetter, secondo cui le connessioni che collegano cluster densi e coesi sono fondamentali per la circolazione delle informazioni e la coesione complessiva della rete.
+
+Ci chiediamo quindi: *per fare da ponte tra le diverse comunità dell'universo Marvel, conta maggiormente l'intelligenza o la forza fisica di un personaggio?* La nostra ipotesi di partenza è che l'intelligenza giochi un ruolo preponderante. Da un punto di vista logico e narrativo, i personaggi più intelligenti (come scienziati, strateghi o leader) tendono a partecipare a missioni trasversali, risolvere crisi globali o collaborare con formazioni eterogenee, mentre la forza bruta è spesso una caratteristica funzionale a singoli scontri locali all'interno del proprio sottogruppo di appartenenza.
+
+# 2. Costruzione della Rete e Metriche
+
+Per modellare le interazioni, abbiamo costruito un grafo non orientato a partire dalle coppie di co-apparizione, aggregando i duplicati in modo da calcolare la frequenza delle interazioni come peso dell'arco. Per quantificare la capacità di ciascun personaggio di fungere da intermediario, abbiamo calcolato la *Betweenness Centrality*, una metrica che misura la proporzione di cammini minimi (geodetiche) tra tutte le possibili coppie di nodi che transitano attraverso un determinato vertice. Contestualmente, abbiamo identificato la struttura delle comunità mediante l'algoritmo di Louvain, basato sull'ottimizzazione della modularità. In entrambi i passaggi è stato impostato `weights = NA`: sebbene i pesi siano stati conservati come attributo informativo per visualizzazioni successive, il calcolo puramente topologico non pesato evita che archi con frequenze di co-apparizione sproporzionatamente alte (tipiche di comprimari dello stesso ciclo narrativo) distorcano la misura dei ponti strutturali globali.
+
+```{r rete}
+library(tidyverse)
+library(igraph)
+
+db_leg <- read.csv("hero-network.csv")
+
+marvel_grafo <- graph_from_data_frame(db_leg, directed = FALSE)
+E(marvel_grafo)$weight <- 1
+marvel_grafo <- igraph::simplify(marvel_grafo, edge.attr.comb = list(weight = "sum"))
+
+# weights = NA: conservo i pesi come informazione ma calcolo NON pesato,
+# per coerenza con la community detection
+punteggio_betweenness <- betweenness(marvel_grafo, normalized = TRUE, weights = NA)
+
+db_nodi <- data.frame(
+  Character = V(marvel_grafo)$name,
+  Betweenness = punteggio_betweenness
+)
+
+communities <- cluster_louvain(marvel_grafo, weights = NA)
+db_nodi$Community <- membership(communities)
+```
+
+# 3. Integrazione dei Dati (Data Join)
+
+L'integrazione tra il grafo di co-apparizione e il dataset degli attributi ha richiesto un'attenta fase di data cleaning e standardizzazione per creare una chiave di join univoca e affidabile. In primo luogo, abbiamo uniformato le stringhe rimuovendo punteggiatura, spazi superflui e convertendo tutto in minuscolo per risolvere discrepanze come "Spider-Man" rispetto a "spiderman". Un passaggio metodologico decisivo è stato il trattamento dei nomi contenenti la barra ("/"): troncando le stringhe al primo delimitatore per isolare il nome principale dall'alter-ego o dalla specifica versione del personaggio, i matching recuperati sono aumentati drasticamente da 77 a 236. Successivamente, poiché il dataset dei poteri conteneva eroi di diverse case editrici, abbiamo applicato un filtro stringente tenendo solo le righe con publisher "Marvel Comics", scendendo da 236 a 197 entità pienamente valide, ed eliminato i record duplicati tramite `distinct()`. Rimuovendo infine i valori mancanti sulle scale dei poteri, abbiamo ottenuto un dataset finale di circa 196 personaggi. È doveroso sottolineare che questo campione rappresenta principalmente i personaggi più iconici e ricorrenti della casa editrice, garantendo tuttavia un insieme solido per l'analisi.
+
+```{r join}
+db_eroi <- read.csv("superHeroes.csv")
+
+db_nodi <- db_nodi %>%
+  mutate(join_key = str_replace_all(Character, "/.*", "")) %>%
+  mutate(join_key = str_to_lower(join_key)) %>%
+  mutate(join_key = str_replace_all(join_key, "[[:punct:]]", "")) %>%
+  mutate(join_key = str_squish(join_key))
+
+db_eroi <- db_eroi %>%
+  filter(Publisher == "Marvel Comics") %>%
+  mutate(join_key = str_to_lower(Name)) %>%
+  mutate(join_key = str_replace_all(join_key, "[[:punct:]]", "")) %>%
+  mutate(join_key = str_squish(join_key)) %>%
+  distinct(join_key, .keep_all = TRUE)
+
+db_analisi <- inner_join(db_nodi, db_eroi, by = "join_key") %>%
+  mutate(
+    Intelligence = as.numeric(Intelligence),
+    Strength     = as.numeric(Strength)
+  ) %>%
+  select(Character, Betweenness, Community, Intelligence, Strength, Group.Affiliation, Publisher) %>%
+  drop_na(Intelligence, Strength)
+
+nrow(db_analisi)
+```
+
+# 4. Analisi Statistica: intelligenza o forza?
+
+Per verificare la nostra ipotesi, abbiamo impostato una procedura statistica a tre livelli. Inizialmente calcoliamo i coefficienti di correlazione lineare di Pearson tra la Betweenness Centrality e le due variabili indipendenti (Intelligenza e Forza). Successivamente, eseguiamo i test d'ipotesi inferenziali (`cor.test`) per accertare se le correlazioni osservate siano statisticamente significative e non imputabili al caso. Infine, stimiamo un modello di regressione lineare multipla (`lm`) per valutare l'effetto parziale di ciascun attributo tenendo sotto controllo l'altro.
+
+```{r correlazioni}
+cor(db_analisi$Betweenness, db_analisi$Intelligence, method = "pearson")
+cor(db_analisi$Betweenness, db_analisi$Strength,     method = "pearson")
+
+cor.test(db_analisi$Betweenness, db_analisi$Intelligence, method = "pearson")
+cor.test(db_analisi$Betweenness, db_analisi$Strength,     method = "pearson")
+
+modello <- lm(Betweenness ~ Intelligence + Strength, data = db_analisi)
+summary(modello)
+```
+
+I risultati empirici confermano chiaramente l'ipotesi iniziale:
+- L'**Intelligenza** mostra una correlazione lineare positiva pari a circa $r \approx 0.26$, con un p-value ampiamente inferiore alla soglia critica ($p < 0.001$), risultando statisticamente significativa.
+- La **Forza**, al contrario, presenta una correlazione prossima allo zero ($r \approx 0.01$) con un $p = 0.86$, confermando l'assenza di qualsiasi legame lineare con la centralità di intermediazione.
+- Il modello di regressione lineare multipla ribadisce questo quadro: a parità di forza fisica, l'intelligenza mantiene un coefficiente positivo e significativo ($\beta > 0, p < 0.001$), mentre la forza non esercita alcun effetto marginale rilevante.
+
+Un aspetto metodologico fondamentale riguarda il coefficiente di determinazione: l'R² del modello è modesto ($R^2 \approx 0.07$, circa il 7% di varianza spiegata). Questa discrepanza tra significatività statistica e dimensione dell'effetto è cruciale: l'effetto dell'intelligenza è reale e sistematico, ma l'essere un "ponte" narrativo dipende da una molteplicità di altri fattori editoriali e di trama non catturati dalle sole schede di potenza fisica o mentale.
+
+```{r scatter}
+ggplot(db_analisi, aes(x = Intelligence, y = Betweenness)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(title = "Impatto dell'intelligenza sulla centralità",
+       x = "Intelligenza", y = "Centralità (Betweenness)")
+
+ggplot(db_analisi, aes(x = Strength, y = Betweenness)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(title = "Impatto della forza sulla centralità",
+       x = "Forza", y = "Centralità (Betweenness)")
+```
+
+# 5. Profilo delle Comunità
+
+Spostando il livello di analisi dal singolo nodo al livello aggregato dei gruppi, esaminiamo le proprietà medie delle comunità emerse dall'algoritmo di Louvain. Per garantire robustezza statistica ed evitare distorsioni causate da micro-cluster periferici, abbiamo applicato un filtro escludendo le comunità con meno di 5 membri (`Numero_Personaggi >= 5`). Il confronto tra le medie evidenzia una coerenza con quanto emerso a livello individuale: le comunità caratterizzate da una Betweenness media più elevata tendono ad esibire livelli medi di intelligenza superiori, confermando come i gruppi centrali nella rete dell'universo Marvel aggreghino figure con profili intellettivi e strategici di spicco.
+
+```{r comunita}
+db_analisi %>%
+  group_by(Community) %>%
+  summarise(
+    Numero_Personaggi = n(),
+    Intelligenza_Media = mean(Intelligence),
+    Forza_Media        = mean(Strength),
+    Betweenness_Media  = mean(Betweenness)
+  ) %>%
+  filter(Numero_Personaggi >= 5)
+```
+
+# 6. Text Mining delle Affiliazioni
+
+Per assegnare un'etichetta semantica e interpretabile a ciascuna comunità individuata per via topologica, abbiamo applicato la tecnica di text mining **TF-IDF** (*Term Frequency - Inverse Document Frequency*) sulle descrizioni delle affiliazioni. La logica alla base del TF-IDF premia i termini molto frequenti all'interno di una specifica comunità ma rari nel resto del dataset, penalizzando parole onnipresenti (come "Avengers", che compare trasversalmente in molti personaggi e non fungerebbe da buon discriminante). Grazie a questo approccio, ogni cluster riceve automaticamente il nome del gruppo narrativo più distintivo (es. X-Men, Sinister Six, Fantastic Four), offrendo un'eccellente validazione empirica: le comunità matematiche scoperte da Louvain corrispondono effettivamente a fazioni e team reali delle pubblicazioni Marvel. Come indicato, i blocchi dedicati al calcolo del TF-IDF e all'analisi di co-occorrenza sono stati sviluppati con supporto assistito in conformità con la policy di trasparenza.
+
+```{r tokenizzazione}
+token_affiliazioni <- db_analisi %>%
+  select(Community, Group.Affiliation) %>%
+  separate_rows(Group.Affiliation, sep = ",") %>%
+  mutate(termine = str_squish(str_to_lower(Group.Affiliation))) %>%
+  filter(termine != "")
+```
+
+```{r tfidf}
+library(tidytext)
+# === AI: ponderazione TF-IDF per trovare l'affiliazione distintiva di ogni
+# comunità (frequente nel gruppo ma rara negli altri) ===
+tfidf_affiliazioni <- token_affiliazioni %>%
+  count(Community, termine) %>%
+  bind_tf_idf(termine, Community, n)
+
+nomi_comunita <- tfidf_affiliazioni %>%
+  filter(n >= 2) %>%
+  group_by(Community) %>%
+  slice_max(tf_idf, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(Community, termine)
+# === fine AI ===
+
+nomi_comunita
+```
+
+```{r cooccorrenza}
+library(widyr)
+token_per_personaggio <- db_analisi %>%
+  select(Character, Group.Affiliation) %>%
+  separate_rows(Group.Affiliation, sep = ",") %>%
+  mutate(termine = str_squish(str_to_lower(Group.Affiliation))) %>%
+  filter(termine != "", termine != "-")
+
+# === AI: co-occorrenza -- coppie di affiliazioni condivise dagli stessi personaggi ===
+coppie_affiliazioni <- token_per_personaggio %>%
+  pairwise_count(termine, Character, sort = TRUE)
+# === fine AI ===
+
+head(coppie_affiliazioni, 10)
+```
+
+# 7. Visualizzazione: i Boundary Spanner
+
+La visualizzazione grafica illustra il sotto-grafo indotto costituito dai 15 personaggi con la più elevata Betweenness Centrality. Il layout adottato è di tipo force-directed (a molle): i nodi che co-appaiono più frequentemente si attraggono e tendono a disporsi vicini, mentre quelli meno collegati si allontanano. In questo modo la posizione nello spazio non è casuale ma riflette l'intensità delle relazioni, rendendo visibili sia le "isole" (i gruppi coesi di personaggi) sia i "ponti" (i nodi centrali che le collegano).
+
+La dimensione dei nodi riflette il punteggio di Betweenness, evidenziando i nodi-ponte cardine come Spider-Man, Iron Man e Captain America; il colore indica la comunità di appartenenza, identificata tramite il termine distintivo ricavato dal TF-IDF; la trasparenza degli archi è invece proporzionale al peso della co-apparizione, così che i legami più forti risultino più marcati.
+
+È particolarmente interessante notare come Spider-Man venga raggruppato nella comunità dei "Sinister Six": ciò non deriva da una reale affiliazione etica, bensì dalla forte densità di co-apparizioni che Peter Parker intrattiene storicamente nelle sue testate con la sua iconica galleria di nemici.
+
+```{r grafo, fig.width=11, fig.height=8}
+library(tidygraph)
+library(ggraph)
+library(ggrepel)
+
+# i 15 personaggi con betweenness piu' alta (i principali boundary spanner)
+top15 <- db_analisi %>%
+  arrange(desc(Betweenness)) %>%
+  head(15) %>%
+  pull(Character)
+
+
+grafo_ponti <- induced_subgraph(marvel_grafo, vids = V(marvel_grafo)$name %in% top15)
+
+grafo_ponti <- grafo_ponti %>%
+# === AI inizio
+  as_tbl_graph() %>%
+  activate(nodes) %>%  
+# === AI fine
+  left_join(db_analisi, by = c("name" = "Character")) %>%
+  left_join(nomi_comunita, by = "Community")
+
+# 1) le isole (comunita') vengono disposte su un cerchio grande
+# 2) dentro ogni isola, i personaggi vengono disposti su un cerchietto piccolo
+# === AI inizio: sotto-grafo dei top 15 con statistiche e nomi dei gruppi ===
+# --- costruisco un layout "a isole circolari" -----------------------------
+nodi_df <- grafo_ponti %>% activate(nodes) %>% as_tibble()
+nodi_df$idx <- seq_len(nrow(nodi_df))
+
+nodi_df$Community <- as.numeric(nodi_df$Community)   # <-- AGGIUNGI: converte in numero normale
+
+gruppi <- unique(nodi_df$Community)
+n_gruppi <- length(gruppi)
+
+# centro di ogni isola sul cerchio grande (raggio 10)
+centri <- tibble(
+  Community = gruppi,
+  cx = 10 * cos(2 * pi * seq_along(gruppi) / n_gruppi),
+  cy = 10 * sin(2 * pi * seq_along(gruppi) / n_gruppi)
+)
+
+# posizione di ogni nodo: centro dell'isola + un cerchietto piccolo (raggio 2.5)
+nodi_df <- nodi_df %>%
+  left_join(centri, by = "Community") %>%
+  group_by(Community) %>%
+  mutate(
+    k = row_number(),
+    m = n(),
+    x = cx + 2.5 * cos(2 * pi * k / m),
+    y = cy + 2.5 * sin(2 * pi * k / m)
+  ) %>%
+  ungroup()
+
+# creo il layout manuale con le coordinate x, y calcolate
+layout_isole <- create_layout(grafo_ponti, layout = "manual",
+                              x = nodi_df$x, y = nodi_df$y)
+# === AI fine ===
+
+# disegno: archi pesati (spesso+opaco = legame forte; sottile+trasparente = debole)
+ggraph(layout_isole) +
+  geom_edge_link(aes(width = weight, alpha = weight), color = "firebrick") +
+  geom_node_point(aes(size = Betweenness, color = termine)) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+  scale_edge_width(range = c(0.2, 2)) +
+  scale_edge_alpha(range = c(0.1, 0.8)) +
+  labs(title = "I boundary spanner Marvel: isole e ponti",
+       color = "Comunità", size = "Betweenness")
+```
+
+# 8. Conclusioni
+
+In conclusione, il presente lavoro consente di rispondere in modo puntuale alla domanda di ricerca iniziale: nell'Universo Marvel è l'**intelligenza**, e non la forza, a costituire un fattore correlato alla capacità di agire da *boundary spanner* ($r \approx 0.26, p < 0.001$). I personaggi che collegano comunità diverse si distinguono per versatilità tattica e scientifica, mentre la mera potenza fisica non incide sulla centralità di rete ($r \approx 0.01, p = 0.86$). 
+
+Tuttavia, il valore contenuto dell'R² ($\approx 0.07$) evidenzia che il ruolo di snodo narrativo è influenzato in larga misura da logiche editoriali, popolarità commerciale e scelte di sceneggiatura nei grandi eventi crossover. L'integrazione del text mining (TF-IDF) ha arricchito lo studio validando l'analisi strutturale e dimostrando la corrispondenza tra partizioni topologiche e team narrativi effettivi.
+
+Tra i limiti del lavoro vanno segnalati la dimensione campionaria (~196 eroi), che seleziona implicitamente i personaggi di maggiore rilievo, la natura semi-strutturata del campo testuale delle affiliazioni e la soggettività intrinseca dei punteggi di potere. Possibili sviluppi futuri potrebbero estendere l'indagine confrontando la Betweenness con altre metriche di centralità (come Eigenvector o PageRank) ed esplorando ulteriori attributi qualitativi quali l'allineamento morale o la longevità editoriale dei personaggi.
+
+# Nota sull'uso dell'AI
+
+I blocchi delimitati da `# === AI ... ===` (ponderazione TF-IDF, co-occorrenza,
+estrazione e arricchimento del sotto-grafo) sono stati sviluppati con assistenza
+AI, come consentito dalla policy. Costituiscono circa il 20% del codice
+sostanziale del progetto. Tutto il resto è stato scritto e adattato dal
+candidato. Il ragionamento dietro ogni blocco assistito è documentato nei
+commenti e comprensibile dal candidato.
+```
